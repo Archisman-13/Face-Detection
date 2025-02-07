@@ -1,132 +1,120 @@
 package epam.sureveillance.headcount.controller;
 
 import org.opencv.core.*;
-import org.opencv.dnn.Dnn;
-import org.opencv.dnn.Net;
-import org.opencv.imgproc.Imgproc;
+import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.videoio.VideoCapture;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.http.*;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestTemplate;
 
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
 import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.Base64;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Map;
 
 @RestController
-class HeadcountController {
+public class HeadcountController {
     private final VideoCapture capture;
-
-    // YOLO Model
-    private final Net yoloNet;
-
-    // Class names (for filtering 'person')
-    private final List<String> classNames;
+    private static final String IMAGE_PATH = "src/main/resources/capture/captured_frame.jpg";
+    private static final String DETECTIONS_PATH = "src/main/resources/capture/detections/";
+    private static final String DETECTED_IMAGE_PATH = DETECTIONS_PATH + "detected_frame.jpg";
+    private static final String PYTHON_API_URL = "http://127.0.0.1:5000/detect";
 
     public HeadcountController() {
-        System.loadLibrary(Core.NATIVE_LIBRARY_NAME); // Ensure OpenCV loads
+        System.loadLibrary(Core.NATIVE_LIBRARY_NAME); // Load OpenCV
 
-        // Load YOLO model (with absolute paths)
-        String cfgPath = "C:\\Users\\archisman_das\\Downloads\\yolov3.cfg";
-        String weightsPath = "C:\\Users\\archisman_das\\Downloads\\yolov3.weights";
-        this.yoloNet = Dnn.readNetFromDarknet(cfgPath, weightsPath);
-
-        // Load the class names (the 'coco.names' file contains the names of all the detected objects)
-        this.classNames = loadClassNames("C:\\Users\\archisman_das\\Downloads\\coco.names");  // Replace with the absolute path to coco.names
-
-        // Open external camera (Change index if needed)
+        // Open webcam
         this.capture = new VideoCapture(0);
         if (!this.capture.isOpened()) {
-            throw new RuntimeException("Error: External Webcam not accessible!");
+            throw new RuntimeException("❌ Error: Camera not accessible!");
+        }
+
+        // Ensure detection directory exists
+        File detectionsDir = new File(DETECTIONS_PATH);
+        if (!detectionsDir.exists()) {
+            detectionsDir.mkdirs();
         }
     }
 
-    @GetMapping("/capture")
-    public String captureFrame() throws IOException {
+    /**
+     * Capture a frame and save it to `resources/capture/`
+     */
+    @PostMapping("/capture")
+    public ResponseEntity<String> captureFrame() {
+        if (!capture.isOpened()) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("{\"error\": \"Camera not accessible\"}");
+        }
+
         Mat frame = new Mat();
         capture.read(frame);
 
         if (frame.empty()) {
-            return "Error: No frame captured!";
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("{\"error\": \"No frame captured\"}");
         }
 
-        // Detect objects using YOLO
-        List<Rect> yoloDetections = detectWithYolo(frame);
-
-        int headCount = yoloDetections.size();
-
-        // Draw rectangles around detected objects (persons only)
-        for (Rect rect : yoloDetections) {
-            Imgproc.rectangle(frame, new Point(rect.x, rect.y),
-                    new Point(rect.x + rect.width, rect.y + rect.height),
-                    new Scalar(0, 255, 0), 2);  // Green color for persons
+        // Ensure directory exists
+        File directory = new File("src/main/resources/capture/");
+        if (!directory.exists()) {
+            directory.mkdirs();
         }
 
-        // Convert Mat to BufferedImage
-        BufferedImage image = matToBufferedImage(frame);
+        // Save the frame as an image
+        boolean saved = Imgcodecs.imwrite(IMAGE_PATH, frame);
+        if (!saved) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("{\"error\": \"Failed to save image\"}");
+        }
 
-        // Convert BufferedImage to Base64 String
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        ImageIO.write(image, "jpg", baos);
-        String base64Image = Base64.getEncoder().encodeToString(baos.toByteArray());
-
-        return "{\"headcount\": " + headCount + ", \"image\": \"data:image/jpg;base64," + base64Image + "\"}";
+        System.out.println("✅ Image successfully saved: " + new File(IMAGE_PATH).getAbsolutePath());
+        return ResponseEntity.ok("{\"message\": \"Frame captured successfully\", \"path\": \"" + IMAGE_PATH + "\"}");
     }
 
-    private List<Rect> detectWithYolo(Mat frame) {
-        List<Rect> boxes = new ArrayList<>();
-        Mat blob = Dnn.blobFromImage(frame, 1.0 / 255, new Size(416, 416), new Scalar(0, 0, 0), true, false);
+    /**
+     * Send the captured image to the Python API for headcount detection
+     */
+    @GetMapping("/headcount")
+    public ResponseEntity<String> getHeadcount() throws IOException {
+        File file = new File(IMAGE_PATH);
 
-        yoloNet.setInput(blob);
-        List<Mat> detections = new ArrayList<>();
-        yoloNet.forward(detections, yoloNet.getUnconnectedOutLayersNames());
-
-        // Iterate over each detection and filter based on the 'person' class
-        for (Mat detection : detections) {
-            for (int i = 0; i < detection.rows(); i++) {
-                double confidence = detection.get(i, 4)[0];
-                if (confidence > 0.99) {
-                    // Get class index for the detected object (classId)
-                    int classId = (int) detection.get(i, 5)[0];  // The class ID starts from index 5 in YOLO output
-                    System.out.println(classId);
-                    // Only process 'person' class (classId 0 corresponds to "person" in COCO dataset)
-                    if (classId == 0) {
-                        // Get bounding box coordinates for the detected object
-                        int x = (int) (detection.get(i, 0)[0] * frame.cols());
-                        int y = (int) (detection.get(i, 1)[0] * frame.rows());
-                        int width = (int) (detection.get(i, 2)[0] * frame.cols());
-                        int height = (int) (detection.get(i, 3)[0] * frame.rows());
-                        boxes.add(new Rect(x, y, width, height));  // Add the bounding box for 'person'
-                    }
-                }
-            }
+        if (!file.exists()) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("{\"error\": \"No captured image found\"}");
         }
 
-        return boxes;
-    }
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
 
-    private List<String> loadClassNames(String path) {
-        List<String> classNames = new ArrayList<>();
-        try (BufferedReader br = new BufferedReader(new FileReader(path))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                classNames.add(line);
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        body.add("file", new FileSystemResource(file));
+
+        HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
+        RestTemplate restTemplate = new RestTemplate();
+
+        ResponseEntity<Map> response = restTemplate.exchange(
+                PYTHON_API_URL, HttpMethod.POST, requestEntity, Map.class
+        );
+
+        if (response.getStatusCode() != HttpStatus.OK || response.getBody() == null) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("{\"error\": \"Failed to get response from detection API\"}");
         }
-        return classNames;
-    }
 
-    private BufferedImage matToBufferedImage(Mat mat) {
-        int width = mat.width();
-        int height = mat.height();
-        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_3BYTE_BGR);
-        byte[] data = new byte[width * height * (int) mat.elemSize()];
-        mat.get(0, 0, data);
-        image.getRaster().setDataElements(0, 0, width, height, data);
-        return image;
+        // Extract headcount and Base64 image from Python response
+        Map<String, Object> responseBody = response.getBody();
+        int headcount = (int) responseBody.get("headcount");
+        String base64Image = (String) responseBody.get("image");
+
+        // Convert Base64 to image and save it
+        byte[] imageBytes = Base64.getDecoder().decode(base64Image);
+        Files.write(Paths.get(DETECTED_IMAGE_PATH), imageBytes);
+
+        // Return JSON response with headcount and detected image
+        return ResponseEntity.ok("{\"headcount\": " + headcount + ", \"image\": \"data:image/jpg;base64," + base64Image + "\"}");
     }
 }
